@@ -350,7 +350,7 @@ class KALAwardFinder:
         """
         여러 목적지를 순차 조회하여 보너스 좌석이 남아있는 노선 목록을 추출합니다.
         (출국편: dep ➔ destinations / 귀국편: destinations ➔ dep)
-        
+
         :return: 좌석이 존재하는 목적지별 집계 데이터 목록
         """
         if airport_names is None:

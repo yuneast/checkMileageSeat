@@ -35,7 +35,7 @@ class AwardSeatMonitor:
         self.config_path = config_path
         self.config = load_config(config_path) if config_path else load_config()
         self.tracker = SeatTracker()
-        self.finder = KALAwardFinder(headless=True)
+        self.finder = KALAwardFinder(headless=False)
         self._init_notifier()
         self.running = False
 

@@ -3,9 +3,8 @@ import datetime
 import json
 import logging
 import os
+import subprocess
 import sys
-import threading
-import time
 from flask import Flask, render_template, request, jsonify
 
 if sys.platform == "win32":
@@ -20,7 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import load_config, save_config, SEAT_CLASS_NAMES, MAJOR_AIRPORTS, DESTINATIONS_BY_REGION
 from kal_seat_finder import KALAwardFinder
-from tracker import SeatTracker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("kal_webapp")
@@ -30,94 +28,6 @@ app = Flask(
     template_folder=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates"),
     static_folder=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
 )
-
-# 백그라운드 모니터링 상태 전역 변수
-monitor_state = {
-    "is_running": False,
-    "last_check_time": None,
-    "last_results_count": 0,
-    "last_new_seats_count": 0,
-    "logs": []
-}
-monitor_thread: threading.Thread = None
-monitor_stop_event = threading.Event()
-
-def add_log(msg: str):
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    entry = f"[{timestamp}] {msg}"
-    monitor_state["logs"].append(entry)
-    if len(monitor_state["logs"]) > 100:
-        monitor_state["logs"].pop(0)
-
-def background_monitor_worker():
-    """백그라운드 스레드에서 주기적으로 모니터링을 수행하는 루커"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    add_log("백그라운드 모니터링 스레드가 시작되었습니다.")
-    tracker = SeatTracker()
-
-    async def check_cycle():
-        finder = KALAwardFinder(headless=True)
-        try:
-            cfg = load_config()
-            routes = cfg.get("routes", [])
-            total_found = 0
-            total_new = 0
-
-            for r in routes:
-                if monitor_stop_event.is_set():
-                    break
-                dep = r.get("departure", "ICN")
-                dep_name = r.get("departure_name", dep)
-                arr = r.get("arrival", "NRT")
-                arr_name = r.get("arrival_name", arr)
-                months = r.get("months", [])
-                classes = r.get("seat_classes", ["X", "O", "A", "Z"])
-
-                add_log(f"좌석 검사 중: {dep_name}({dep}) ➔ {arr_name}({arr}) {months}월")
-                seats = await finder.search_route_award_seats(
-                    dep=dep, arr=arr, months=months, target_classes=classes, only_available=True
-                )
-                for s in seats:
-                    s["departure_name"] = dep_name
-                    s["arrival_name"] = arr_name
-
-                total_found += len(seats)
-                new_seats = tracker.update_and_get_new_seats(seats)
-                total_new += len(new_seats)
-
-                if new_seats:
-                    add_log(f"🔔 {dep_name}➔{arr_name}: 신규 좌석 {len(new_seats)}건 발견!")
-                else:
-                    add_log(f"↳ {dep_name}➔{arr_name}: 현재 {len(seats)}개 잔여 (신규 변동 없음)")
-
-            monitor_state["last_check_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            monitor_state["last_results_count"] = total_found
-            monitor_state["last_new_seats_count"] = total_new
-            add_log(f"검사 주기 완료 (전체 잔여 {total_found}개 / 신규 오픈 {total_new}개)")
-
-        finally:
-            await finder.close()
-
-    while not monitor_stop_event.is_set():
-        try:
-            loop.run_until_complete(check_cycle())
-        except Exception as e:
-            add_log(f"❌ 모니터링 오류 발생: {e}")
-
-        # 주기 대기
-        cfg = load_config()
-        interval = max(1, cfg.get("monitoring", {}).get("check_interval_minutes", 15))
-        add_log(f"다음 검사까지 {interval}분 대기합니다.")
-
-        for _ in range(interval * 60):
-            if monitor_stop_event.is_set():
-                break
-            time.sleep(1)
-
-    add_log("백그라운드 모니터링 스레드가 종료되었습니다.")
-    monitor_state["is_running"] = False
 
 @app.route("/")
 def index():
@@ -148,15 +58,30 @@ def get_seat_classes_api():
 def get_regions_api():
     return jsonify(DESTINATIONS_BY_REGION)
 
+def _load_latest_dataset():
+    """data/history/의 가장 최신 스냅샷을 읽어온다. 없으면 docs/data/latest_seats.json으로 폴백."""
+    if os.path.isdir(HISTORY_DIR):
+        files = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
+        if files:
+            with open(os.path.join(HISTORY_DIR, files[0]), "r", encoding="utf-8") as f:
+                return json.load(f), files[0][:-5]
+    fallback_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "data", "latest_seats.json")
+    if os.path.isfile(fallback_path):
+        with open(fallback_path, "r", encoding="utf-8") as f:
+            return json.load(f), None
+    return None, None
+
+
 @app.route("/api/explore", methods=["POST"])
 def explore_destinations_api():
-    """특정 월에 마일리지 빈 좌석이 남아있는 목적지들을 일괄 탐색"""
+    """저장된 최신 스냅샷(data/history/)에서 목적지별 빈 좌석을 조회 (실시간 스크래핑 안 함)"""
     data = request.json or {}
     dep = data.get("departure", "ICN")
     region_key = data.get("region", "ALL")
     custom_airports = data.get("airports", [])
     month = data.get("month")
-    classes = data.get("seat_classes", ["X", "O", "A", "Z"])
+    classes = set(data.get("seat_classes", ["X", "O", "A", "Z"]))
+    direction = data.get("direction", "OUTBOUND")
 
     if not month:
         now = datetime.datetime.now()
@@ -174,36 +99,62 @@ def explore_destinations_api():
         target_dests = DESTINATIONS_BY_REGION[region_key]["airports"]
     else:
         target_dests = ["NRT", "KIX", "FUK", "BKK", "DAD", "SIN", "CDG", "HNL"]
+    target_dests_set = set(target_dests)
 
-    direction = data.get("direction", "OUTBOUND")
-
-    async def do_explore():
-        finder = KALAwardFinder(headless=True)
-        try:
-            return await finder.explore_available_destinations(
-                dep=dep,
-                destinations=target_dests,
-                year_month=month,
-                target_classes=classes,
-                airport_names=MAJOR_AIRPORTS,
-                direction=direction
-            )
-        finally:
-            await finder.close()
-
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        results = loop.run_until_complete(do_explore())
+    dataset, snapshot_date = _load_latest_dataset()
+    if not dataset:
         return jsonify({
-            "success": True,
-            "data": results,
-            "scanned_count": len(target_dests),
-            "found_count": len(results)
+            "success": False,
+            "message": "저장된 데이터가 아직 없습니다. 배치(build_static_data.py)가 최소 1회 실행된 뒤에 조회할 수 있습니다."
+        }), 404
+
+    routes_data = dataset.get("routes_data", {})
+    results = []
+
+    for item in dataset.get("destinations_summary", []):
+        if item.get("direction") != direction:
+            continue
+        if item.get("month") != month:
+            continue
+        if direction == "OUTBOUND":
+            if item.get("departure") != dep or item.get("destination") not in target_dests_set:
+                continue
+        else:
+            if item.get("destination") != dep or item.get("departure") not in target_dests_set:
+                continue
+
+        route_key = f"{item['departure']}_{item['destination']}"
+        route_flights = routes_data.get(route_key, {}).get("flights", [])
+        matched_flights = [
+            fl for fl in route_flights
+            if fl.get("booking_class") in classes and str(fl.get("date", "")).startswith(month)
+        ]
+        if not matched_flights:
+            continue
+
+        results.append({
+            "direction": item["direction"],
+            "departure": item["departure"],
+            "departure_name": item["departure_name"],
+            "destination": item["destination"],
+            "destination_name": item["destination_name"],
+            "total_available_seats": len(matched_flights),
+            "available_classes": sorted(set(fl["booking_class"] for fl in matched_flights)),
+            "available_dates": sorted(set(fl["date"] for fl in matched_flights)),
+            "sample_flights": matched_flights[:15],
+            "all_flights": matched_flights
         })
-    except Exception as e:
-        logger.error(f"Explore API error: {e}", exc_info=True)
-        return jsonify({"success": False, "message": str(e)}), 500
+
+    results.sort(key=lambda x: x["total_available_seats"], reverse=True)
+
+    return jsonify({
+        "success": True,
+        "data": results,
+        "scanned_count": len(target_dests),
+        "found_count": len(results),
+        "snapshot_date": snapshot_date,
+        "snapshot_updated_at": dataset.get("updated_at")
+    })
 
 @app.route("/api/search", methods=["POST"])
 def direct_search_api():
@@ -220,7 +171,7 @@ def direct_search_api():
         months = [now.strftime("%Y%m")]
 
     async def do_search():
-        finder = KALAwardFinder(headless=True)
+        finder = KALAwardFinder(headless=False)
         try:
             return await finder.search_route_award_seats(
                 dep=dep,
@@ -241,32 +192,92 @@ def direct_search_api():
         logger.error(f"Search API error: {e}", exc_info=True)
         return jsonify({"success": False, "message": str(e)}), 500
 
-@app.route("/api/monitor/status", methods=["GET"])
-def get_monitor_status():
-    return jsonify(monitor_state)
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
+BATCH_LOG_PATH = os.path.join(DATA_DIR, "daily_batch.log")
+SCAN_PID_FILE = os.path.join(DATA_DIR, "scan.pid")
 
-@app.route("/api/monitor/start", methods=["POST"])
-def start_monitor():
-    global monitor_thread, monitor_stop_event
-    if monitor_state["is_running"]:
-        return jsonify({"success": True, "message": "모니터링이 이미 실행 중입니다."})
 
-    monitor_stop_event.clear()
-    monitor_state["is_running"] = True
-    monitor_thread = threading.Thread(target=background_monitor_worker, daemon=True)
-    monitor_thread.start()
-    return jsonify({"success": True, "message": "모니터링이 시작되었습니다."})
+def is_scan_running() -> bool:
+    if not os.path.isfile(SCAN_PID_FILE):
+        return False
+    try:
+        with open(SCAN_PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)  # 존재 여부만 확인, 신호는 안 보냄
+        return True
+    except (OSError, ValueError):
+        return False
 
-@app.route("/api/monitor/stop", methods=["POST"])
-def stop_monitor():
-    global monitor_stop_event
-    if not monitor_state["is_running"]:
-        return jsonify({"success": True, "message": "모니터링이 이미 중지되어 있습니다."})
 
-    monitor_stop_event.set()
-    monitor_state["is_running"] = False
-    add_log("모니터링 중지 요청됨...")
-    return jsonify({"success": True, "message": "모니터링 중지 요청이 전송되었습니다."})
+@app.route("/api/batch_log", methods=["GET"])
+def get_batch_log():
+    """매일 23:05 launchd 배치(build_static_data.py)의 로그 꼬리와 최근 수집 시각을 반환"""
+    lines = []
+    if os.path.isfile(BATCH_LOG_PATH):
+        with open(BATCH_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-200:]
+        lines = [l.rstrip("\n") for l in lines]
+
+    dataset, snapshot_date = _load_latest_dataset()
+    updated_at = dataset.get("updated_at") if dataset else None
+
+    return jsonify({
+        "success": True,
+        "lines": lines,
+        "updated_at": updated_at,
+        "snapshot_date": snapshot_date,
+        "is_running": is_scan_running()
+    })
+
+
+@app.route("/api/trigger_scan", methods=["POST"])
+def trigger_scan():
+    """지금 바로 전체 스캔(build_static_data.py)을 백그라운드로 시작. 이미 돌고 있으면 거부."""
+    if is_scan_running():
+        return jsonify({"success": False, "message": "이미 수집이 진행 중입니다. 로그 탭에서 진행상황을 확인하세요."})
+
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(src_dir, "build_static_data.py")
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    log_f = open(BATCH_LOG_PATH, "a", encoding="utf-8")
+    log_f.write(f"\n===== 수동 수집 시작: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    log_f.flush()
+
+    proc = subprocess.Popen(
+        [sys.executable, script_path, "14"],
+        cwd=src_dir,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        start_new_session=True
+    )
+    with open(SCAN_PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+
+    return jsonify({"success": True, "message": "수집을 시작했습니다. 진행상황은 로그 탭에서 확인할 수 있습니다."})
+
+@app.route("/api/history", methods=["GET"])
+def list_history():
+    """저장된 날짜별 배치 결과 목록 (최신순)"""
+    if not os.path.isdir(HISTORY_DIR):
+        return jsonify({"success": True, "dates": []})
+    dates = sorted(
+        [f[:-5] for f in os.listdir(HISTORY_DIR) if f.endswith(".json")],
+        reverse=True
+    )
+    return jsonify({"success": True, "dates": dates})
+
+@app.route("/api/history/<date_str>", methods=["GET"])
+def get_history_day(date_str):
+    """특정 날짜(YYYY-MM-DD)의 저장된 배치 결과 조회"""
+    safe_name = os.path.basename(date_str)
+    path = os.path.join(HISTORY_DIR, f"{safe_name}.json")
+    if not os.path.isfile(path):
+        return jsonify({"success": False, "message": "해당 날짜의 저장된 데이터가 없습니다."}), 404
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return jsonify({"success": True, "data": data})
 
 def run_server(port: int = 5000):
     print(f"\n========================================================")
